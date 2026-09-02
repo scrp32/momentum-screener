@@ -4,11 +4,12 @@ import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
-# Page Layout Configuration
+# Page setup
 st.set_page_config(
     page_title="Institutional Momentum Screener",
     layout="wide",
     initial_sidebar_state="expanded",
+    menu_items=None,
 )
 
 st.title("📈 Institutional Momentum Screener (NSE / BSE)")
@@ -16,28 +17,77 @@ st.caption(
     "Volatility-Adjusted & Residual Momentum Engine with Real-Time Filtering"
 )
 
-
-# Sidebar Configuration & Filters
 st.sidebar.header("🔍 Screener Filters")
 
-# Sector / Industry Selection or Pre-built Lists
-universe_type = st.sidebar.radio(
+
+# Fetch Universe Lists dynamically from NSE archives with 24h caching
+@st.cache_data(ttl=86400)
+def fetch_universe_tickers(universe_name):
+    urls = {
+        "Nifty 50": (
+            "https://archives.nseindia.com/content/indices/ind_nifty50list.csv"
+        ),
+        "Nifty 100": (
+            "https://archives.nseindia.com/content/indices/ind_nifty100list.csv"
+        ),
+        "Nifty 500": (
+            "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        ),
+        "Nifty Microcap 250": (
+            "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv"
+        ),
+        "Nifty Total Market (~750)": (
+            "https://archives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
+        ),
+    }
+    url = urls.get(universe_name)
+    if not url:
+        return [
+            "RELIANCE.NS",
+            "TCS.NS",
+            "INFY.NS",
+            "HDFCBANK.NS",
+            "ICICIBANK.NS",
+        ]
+
+    try:
+        df = pd.read_csv(url)
+        symbols = df["Symbol"].dropna().str.strip().tolist()
+        return [f"{symbol}.NS" for symbol in symbols]
+    except Exception:
+        # Fallback list if network request to NSE fails
+        return [
+            "RELIANCE.NS",
+            "TCS.NS",
+            "INFY.NS",
+            "HDFCBANK.NS",
+            "ICICIBANK.NS",
+        ]
+
+
+# Universe Dropdown with All Options
+universe_type = st.sidebar.selectbox(
     "Select Stock Universe:",
-    ["Nifty 50", "Nifty Next 50", "Nifty Midcap 100", "Custom List"],
+    [
+        "Nifty 50",
+        "Nifty 100",
+        "Nifty 500",
+        "Nifty Microcap 250",
+        "Nifty Total Market (~750)",
+    ],
+    index=0,
 )
 
-# Benchmark Selection
 benchmark_ticker = st.sidebar.selectbox(
     "Benchmark Index (for Beta/Residual Calculation):",
     ["^NSEI", "^BSESN"],
-    format_func=lambda x: "Nifty 50 (^NSEI)"
-    if x == "^NSEI"
-    else "Sensex (^BSESN)",
+    format_func=lambda x: (
+        "Nifty 50 (^NSEI)" if x == "^NSEI" else "Sensex (^BSESN)"
+    ),
 )
 
 st.sidebar.subheader("Quantitative Metric Thresholds")
 
-# Sliders for Quantitative Filters
 min_score, max_score = st.sidebar.slider(
     "Volatility-Adjusted Score Range:", -3.0, 5.0, (0.5, 4.0), step=0.1
 )
@@ -47,7 +97,7 @@ min_beta, max_beta = st.sidebar.slider(
 )
 
 max_volatility = st.sidebar.slider(
-    "Max Annualized Volatility (%):", 10, 100, 45, step=5
+    "Max Annual Volatility (%):", 10, 100, 45, step=5
 )
 
 min_residual_momentum = st.sidebar.slider(
@@ -55,69 +105,20 @@ min_residual_momentum = st.sidebar.slider(
 )
 
 
-# Helper function to get tickers based on selection
-@st.cache_data(ttl=86400)
-def get_universe_tickers(universe_name):
-    if universe_name == "Nifty 50":
-        return [
-            "RELIANCE.NS",
-            "TCS.NS",
-            "INFY.NS",
-            "HDFCBANK.NS",
-            "ICICIBANK.NS",
-            "TATAMOTORS.NS",
-            "BHARTIARTL.NS",
-            "ITC.NS",
-            "LT.NS",
-            "SBIN.NS",
-            "AXISBANK.NS",
-            "KOTAKBANK.NS",
-            "HINDUNILVR.NS",
-            "BAJFINANCE.NS",
-            "MARUTI.NS",
-            "SUNPHARMA.NS",
-            "TITAN.NS",
-            "ULTRACEMCO.NS",
-            "ASIANPAINT.NS",
-            "NTPC.NS",
-        ]
-    elif universe_name == "Nifty Next 50":
-        return [
-            "BEL.NS",
-            "HAL.NS",
-            "TRENT.NS",
-            "VBL.NS",
-            "ZOMATO.NS",
-            "DLF.NS",
-            "IOC.NS",
-            "REC.NS",
-            "PFC.NS",
-            "BANKBARODA.NS",
-        ]
-    elif universe_name == "Nifty Midcap 100":
-        return [
-            "COALINDIA.NS",
-            "NMDC.NS",
-            "SAIL.NS",
-            "IRFC.NS",
-            "RVNL.NS",
-            "POLYCAB.NS",
-            "PERSISTENT.NS",
-            "MPHASIS.NS",
-        ]
-    else:
-        return ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
-
-
-# Quant Computation Pipeline
+# Fetch and compute price data with caching
 @st.cache_data(ttl=3600)
 def compute_quant_momentum(tickers, benchmark):
     all_tickers = tickers + [benchmark]
-    data = yf.download(all_tickers, period="1y", interval="1d", progress=False)[
-        "Close"
-    ]
+    raw_data = yf.download(
+        all_tickers, period="1y", interval="1d", progress=False
+    )
 
-    bench_returns = data[benchmark].pct_change().dropna()
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        data = raw_data["Close"]
+    else:
+        data = raw_data
+
+    bench_returns = data[benchmark].pct_change(fill_method=None).dropna()
     bench_total_return = (
         data[benchmark].iloc[-1] - data[benchmark].iloc[0]
     ) / data[benchmark].iloc[0]
@@ -130,29 +131,23 @@ def compute_quant_momentum(tickers, benchmark):
         if len(stock_series) < 180:
             continue
 
-        daily_returns = stock_series.pct_change().dropna()
+        daily_returns = stock_series.pct_change(fill_method=None).dropna()
 
-        # Fetch market cap dynamically
         try:
             info = yf.Ticker(ticker).fast_info
-            mcap_cr = round(info.market_cap / 1e7, 2)  # Convert to INR Crores
+            mcap_cr = round(info.market_cap / 1e7, 2)
         except Exception:
             mcap_cr = np.nan
 
-        # 12M-1M Cross-Sectional Momentum
         price_12m_ago = stock_series.iloc[0]
         price_1m_ago = stock_series.iloc[-21]
-        raw_12m_1m_return = (
-            price_1m_ago - price_12m_ago
-        ) / price_12m_ago
+        raw_12m_1m_return = (price_1m_ago - price_12m_ago) / price_12m_ago
 
-        # Volatility Scaling
         annualized_vol = daily_returns.std() * np.sqrt(252)
         vol_adjusted_score = (
             (raw_12m_1m_return / annualized_vol) if annualized_vol > 0 else 0
         )
 
-        # Residual Return (Beta Isolation)
         aligned = pd.concat(
             [daily_returns, bench_returns], axis=1, join="inner"
         ).dropna()
@@ -189,25 +184,32 @@ def compute_quant_momentum(tickers, benchmark):
     return df
 
 
-# Execute Engine
-tickers_list = get_universe_tickers(universe_type)
+tickers_list = fetch_universe_tickers(universe_type)
 
-with st.spinner("Processing stock universe and running quantitative models..."):
+with st.spinner(
+    f"Fetching data for {len(tickers_list)} stocks in {universe_type}..."
+):
     df_raw = compute_quant_momentum(tickers_list, benchmark_ticker)
 
 if not df_raw.empty:
-    # Additional Sidebar Filter for Market Cap
-    min_mcap = int(df_raw["Market Cap (Cr)"].min(skipna=True))
-    max_mcap = int(df_raw["Market Cap (Cr)"].max(skipna=True))
-
-    mcap_range = st.sidebar.slider(
-        "Market Cap Range (₹ Crores):",
-        min_value=min_mcap,
-        max_value=max_mcap,
-        value=(min_mcap, max_mcap),
+    min_mcap = (
+        int(df_raw["Market Cap (Cr)"].min(skipna=True))
+        if not df_raw["Market Cap (Cr)"].isna().all()
+        else 0
+    )
+    max_mcap = (
+        int(df_raw["Market Cap (Cr)"].max(skipna=True))
+        if not df_raw["Market Cap (Cr)"].isna().all()
+        else 100000
     )
 
-    # Filtering Logic
+    mcap_range = st.sidebar.slider(
+        "Market Cap Range (INR Crores):",
+        min_value=min_mcap,
+        max_value=max_mcap if max_mcap > min_mcap else min_mcap + 1000,
+        value=(min_mcap, max_mcap if max_mcap > min_mcap else min_mcap + 1000),
+    )
+
     filtered_df = df_raw[
         (df_raw["Vol-Adjusted Score"] >= min_score)
         & (df_raw["Vol-Adjusted Score"] <= max_score)
@@ -224,26 +226,28 @@ if not df_raw.empty:
         )
     ]
 
-    # Executive Summary Metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Universe Stocks", len(df_raw))
     col2.metric("Filtered Candidates", len(filtered_df))
     col3.metric(
         "Avg Vol-Adjusted Score",
-        f"{filtered_df['Vol-Adjusted Score'].mean():.2f}"
-        if not filtered_df.empty
-        else "N/A",
+        (
+            f"{filtered_df['Vol-Adjusted Score'].mean():.2f}"
+            if not filtered_df.empty
+            else "N/A"
+        ),
     )
     col4.metric(
         "Avg Residual Return",
-        f"{filtered_df['Residual Return (%)'].mean():.2f}%"
-        if not filtered_df.empty
-        else "N/A",
+        (
+            f"{filtered_df['Residual Return (%)'].mean():.2f}%"
+            if not filtered_df.empty
+            else "N/A"
+        ),
     )
 
     st.divider()
 
-    # Data Table View
     st.subheader("📋 Quant Momentum Screener Table")
     st.dataframe(
         filtered_df.style.highlight_max(
@@ -252,7 +256,6 @@ if not df_raw.empty:
         use_container_width=True,
     )
 
-    # Plotly Scatter Chart: Risk vs Momentum Profile
     st.subheader("📊 Momentum Factor Matrix")
     if not filtered_df.empty:
         fig = px.scatter(
@@ -262,7 +265,10 @@ if not df_raw.empty:
             size="Market Cap (Cr)",
             color="Residual Return (%)",
             hover_name="Ticker",
-            title="Volatility vs Vol-Adjusted Momentum (Bubble Size = Market Cap)",
+            title=(
+                "Volatility vs Vol-Adjusted Momentum (Bubble Size = Market"
+                " Cap)"
+            ),
             labels={
                 "Annual Volatility (%)": "Annualized Risk (%)",
                 "Vol-Adjusted Score": "Sharpe-Scaled Momentum",
@@ -271,4 +277,6 @@ if not df_raw.empty:
         )
         st.plotly_chart(fig, use_container_width=True)
 else:
-    st.error("No data fetched. Check your internet connection or ticker universe.")
+    st.error(
+        "No data fetched. Check your internet connection or ticker universe."
+    )
