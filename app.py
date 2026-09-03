@@ -14,7 +14,7 @@ st.set_page_config(
 
 st.title("📈 Institutional Momentum Screener (NSE / BSE)")
 st.caption(
-    "Volatility-Adjusted & Residual Momentum Engine with Real-Time Filtering"
+    "Volatility-Adjusted & Residual Momentum Engine with Parabolic Guardrails"
 )
 
 st.sidebar.header("🔍 Screener Filters")
@@ -55,7 +55,6 @@ def fetch_universe_tickers(universe_name):
         symbols = df["Symbol"].dropna().str.strip().tolist()
         return [f"{symbol}.NS" for symbol in symbols]
     except Exception:
-        # Fallback list if network request to NSE fails
         return [
             "RELIANCE.NS",
             "TCS.NS",
@@ -65,7 +64,7 @@ def fetch_universe_tickers(universe_name):
         ]
 
 
-# Universe Dropdown with All Options
+# Universe Selection
 universe_type = st.sidebar.selectbox(
     "Select Stock Universe:",
     [
@@ -75,7 +74,7 @@ universe_type = st.sidebar.selectbox(
         "Nifty Microcap 250",
         "Nifty Total Market (~750)",
     ],
-    index=0,
+    index=2,  # Default to Nifty 500
 )
 
 benchmark_ticker = st.sidebar.selectbox(
@@ -90,6 +89,19 @@ st.sidebar.subheader("Quantitative Metric Thresholds")
 
 min_score, max_score = st.sidebar.slider(
     "Volatility-Adjusted Score Range:", -3.0, 5.0, (0.5, 4.0), step=0.1
+)
+
+# 🛑 Exhaustion Safeguard: 200 DMA Extension Slider
+max_dma_extension = st.sidebar.slider(
+    "Max 200 DMA Extension (%) [Exhaustion Guardrail]:",
+    10,
+    100,
+    30,
+    step=5,
+    help=(
+        "Filters out stocks trading too far above their 200-day moving average"
+        " (prevents buying parabolic peaks)."
+    ),
 )
 
 min_beta, max_beta = st.sidebar.slider(
@@ -128,7 +140,7 @@ def compute_quant_momentum(tickers, benchmark):
 
     for ticker in tickers_to_process:
         stock_series = data[ticker].dropna()
-        if len(stock_series) < 180:
+        if len(stock_series) < 200:  # Need at least 200 days for 200 DMA
             continue
 
         daily_returns = stock_series.pct_change(fill_method=None).dropna()
@@ -139,6 +151,15 @@ def compute_quant_momentum(tickers, benchmark):
         except Exception:
             mcap_cr = np.nan
 
+        current_price = stock_series.iloc[-1]
+
+        # 200-Day Simple Moving Average & Extension Math
+        sma_200 = stock_series.rolling(window=200).mean().iloc[-1]
+        dma_200_extension = (
+            ((current_price - sma_200) / sma_200) * 100 if sma_200 > 0 else 0
+        )
+
+        # 12M - 1M Cross-Sectional Return
         price_12m_ago = stock_series.iloc[0]
         price_1m_ago = stock_series.iloc[-21]
         raw_12m_1m_return = (price_1m_ago - price_12m_ago) / price_12m_ago
@@ -148,6 +169,7 @@ def compute_quant_momentum(tickers, benchmark):
             (raw_12m_1m_return / annualized_vol) if annualized_vol > 0 else 0
         )
 
+        # Beta & Residual Momentum
         aligned = pd.concat(
             [daily_returns, bench_returns], axis=1, join="inner"
         ).dropna()
@@ -157,7 +179,7 @@ def compute_quant_momentum(tickers, benchmark):
         beta = cov / bench_var if bench_var > 0 else 1.0
 
         stock_total_return = (
-            stock_series.iloc[-1] - stock_series.iloc[0]
+            current_price - stock_series.iloc[0]
         ) / stock_series.iloc[0]
         residual_momentum = stock_total_return - (beta * bench_total_return)
 
@@ -165,6 +187,7 @@ def compute_quant_momentum(tickers, benchmark):
             {
                 "Ticker": ticker.replace(".NS", "").replace(".BO", ""),
                 "Market Cap (Cr)": mcap_cr,
+                "200 DMA Ext (%)": round(dma_200_extension, 2),
                 "12M-1M Return (%)": round(raw_12m_1m_return * 100, 2),
                 "Annual Volatility (%)": round(annualized_vol * 100, 2),
                 "Vol-Adjusted Score": round(vol_adjusted_score, 2),
@@ -210,9 +233,11 @@ if not df_raw.empty:
         value=(min_mcap, max_mcap if max_mcap > min_mcap else min_mcap + 1000),
     )
 
+    # Filter pipeline including 200 DMA Extension
     filtered_df = df_raw[
         (df_raw["Vol-Adjusted Score"] >= min_score)
         & (df_raw["Vol-Adjusted Score"] <= max_score)
+        & (df_raw["200 DMA Ext (%)"] <= max_dma_extension)
         & (df_raw["Beta"] >= min_beta)
         & (df_raw["Beta"] <= max_beta)
         & (df_raw["Annual Volatility (%)"] <= max_volatility)
@@ -260,17 +285,14 @@ if not df_raw.empty:
     if not filtered_df.empty:
         fig = px.scatter(
             filtered_df,
-            x="Annual Volatility (%)",
+            x="200 DMA Ext (%)",
             y="Vol-Adjusted Score",
             size="Market Cap (Cr)",
             color="Residual Return (%)",
             hover_name="Ticker",
-            title=(
-                "Volatility vs Vol-Adjusted Momentum (Bubble Size = Market"
-                " Cap)"
-            ),
+            title="200 DMA Extension vs Vol-Adjusted Momentum Score",
             labels={
-                "Annual Volatility (%)": "Annualized Risk (%)",
+                "200 DMA Ext (%)": "Extension Above 200 DMA (%)",
                 "Vol-Adjusted Score": "Sharpe-Scaled Momentum",
             },
             color_continuous_scale=px.colors.sequential.Viridis,
