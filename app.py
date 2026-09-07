@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -16,10 +17,8 @@ st.set_page_config(
 # PASSWORD PROTECTION FUNCTION
 # -----------------------------------------------------------------------------
 def check_password():
-    """Returns `True` if the user enters the correct password."""
-
     def password_entered():
-        if st.session_state["password_input"] == "quant123":  # 👈 SET YOUR PASSWORD
+        if st.session_state["password_input"] == "quant123":
             st.session_state["password_correct"] = True
             del st.session_state["password_input"]
         else:
@@ -49,32 +48,44 @@ def check_password():
 
 
 # -----------------------------------------------------------------------------
-# PAPER TRADING BACKTEST ENGINE
+# PAPER TRADING SIMULATION ENGINE WITH DYNAMIC ENTRY DATES
 # -----------------------------------------------------------------------------
 def simulate_paper_trade(
     price_series,
+    entry_date,
     capital_per_trade=100000,
     target_pct=0.10,
     stop_loss_pct=0.05,
 ):
-    """Simulates paper trading with a trailing stop-loss and take-profit target.
+    """Simulates paper trading starting from a specific entry_date forward.
 
-    Allocates fixed capital (₹1 Lakh) and tracks PnL, Exit Reason, and Days Held.
+    Allocates fixed capital (₹1 Lakh) and tracks status, days held, trailing stop, and PnL.
     """
-    if len(price_series) < 20:
+    # Ensure datetime index format
+    price_series.index = pd.to_datetime(price_series.index)
+    entry_dt = pd.to_datetime(entry_date)
+
+    # Filter price series from entry date onwards
+    forward_prices = price_series[price_series.index >= entry_dt]
+
+    # If entry date is in the future (e.g. Tomorrow), mark as PENDING
+    if forward_prices.empty or entry_dt > pd.to_datetime(datetime.now().date()):
+        latest_price = price_series.iloc[-1]
         return {
-            "Paper Trade Status": "Insufficient Data",
+            "Entry Date": entry_dt.strftime("%Y-%m-%d"),
+            "Entry Price (INR)": round(latest_price, 2),
+            "Paper Status": "PENDING (Scheduled)",
             "Days Held": 0,
-            "Exit Reason": "N/A",
+            "Exit Reason": "Awaiting Entry",
+            "Exit Date": "N/A",
             "Return (%)": 0.0,
             "PnL (INR)": 0.0,
+            "Current Trailing Stop": round(
+                latest_price * (1 - stop_loss_pct), 2
+            ),
         }
 
-    # Simulate entry 30 trading days ago to evaluate recent execution
-    lookback = min(60, len(price_series) - 1)
-    trade_series = price_series.iloc[-lookback:]
-
-    entry_price = trade_series.iloc[0]
+    entry_price = forward_prices.iloc[0]
     initial_stop = entry_price * (1 - stop_loss_pct)
     target_price = entry_price * (1 + target_pct)
 
@@ -83,42 +94,47 @@ def simulate_paper_trade(
 
     status = "OPEN"
     exit_reason = "Open Position"
-    exit_price = trade_series.iloc[-1]
-    days_held = len(trade_series)
+    exit_price = forward_prices.iloc[-1]
+    exit_date_str = "Active"
+    days_held = len(forward_prices)
 
-    for idx, (date, price) in enumerate(trade_series.items()):
-        # Update peak and trailing stop
+    for idx, (dt, price) in enumerate(forward_prices.items()):
+        # Trail stop-loss if new high achieved
         if price > peak_price:
             peak_price = price
-            # Trail stop-loss 5% below peak price
             current_stop = max(current_stop, peak_price * (1 - stop_loss_pct))
 
-        # Check exit condition 1: Target Hit (+10%)
+        # Condition 1: Take Profit (+10%)
         if price >= target_price:
             status = "CLOSED"
             exit_reason = "Target Hit (+10%)"
             exit_price = target_price
+            exit_date_str = dt.strftime("%Y-%m-%d")
             days_held = idx + 1
             break
 
-        # Check exit condition 2: Trailing Stop Hit (-5% from peak)
+        # Condition 2: Trailing Stop Hit (-5% from peak)
         elif price <= current_stop:
             status = "CLOSED"
             exit_reason = "Trailing Stop Hit"
             exit_price = current_stop
+            exit_date_str = dt.strftime("%Y-%m-%d")
             days_held = idx + 1
             break
 
-    # Calculate return and PnL on ₹1,00,000 allocated capital
     return_pct = ((exit_price - entry_price) / entry_price) * 100
     pnl_inr = capital_per_trade * (return_pct / 100)
 
     return {
-        "Paper Trade Status": status,
+        "Entry Date": entry_dt.strftime("%Y-%m-%d"),
+        "Entry Price (INR)": round(entry_price, 2),
+        "Paper Status": status,
         "Days Held": days_held,
         "Exit Reason": exit_reason,
+        "Exit Date": exit_date_str,
         "Return (%)": round(return_pct, 2),
         "PnL (INR)": round(pnl_inr, 2),
+        "Current Trailing Stop": round(current_stop, 2),
     }
 
 
@@ -128,11 +144,22 @@ def simulate_paper_trade(
 if check_password():
 
     st.title("📈 Institutional Momentum Screener & Paper Trader")
-    st.caption(
-        "Volatility-Adjusted Momentum Engine with Live Paper Trading Execution"
-    )
+    st.caption("Trailing Stop-Loss Execution & Staggered Paper Trading Ledger")
 
-    st.sidebar.header("🔍 Screener Filters")
+    st.sidebar.header("🔍 Screener & Staggering Settings")
+
+    # Entry Date Setup: Tomorrow's Date for 1st stock
+    tomorrow_date = datetime.now().date() + timedelta(days=1)
+    base_start_date = st.sidebar.date_input(
+        "First Candidate Entry Date:", tomorrow_date
+    )
+    stagger_days = st.sidebar.number_input(
+        "Days Stagger Between Subsequent Stocks:",
+        min_value=0,
+        max_value=10,
+        value=1,
+        help="Number of trading days between adding sequential stocks to the portfolio.",
+    )
 
     @st.cache_data(ttl=86400)
     def fetch_universe_tickers(universe_name):
@@ -146,23 +173,8 @@ if check_password():
             "Nifty 500": (
                 "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
             ),
-            "Nifty Microcap 250": (
-                "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv"
-            ),
-            "Nifty Total Market (~750)": (
-                "https://archives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
-            ),
         }
         url = urls.get(universe_name)
-        if not url:
-            return [
-                "RELIANCE.NS",
-                "TCS.NS",
-                "INFY.NS",
-                "HDFCBANK.NS",
-                "ICICIBANK.NS",
-            ]
-
         try:
             df = pd.read_csv(url)
             symbols = df["Symbol"].dropna().str.strip().tolist()
@@ -178,51 +190,21 @@ if check_password():
 
     universe_type = st.sidebar.selectbox(
         "Select Stock Universe:",
-        [
-            "Nifty 50",
-            "Nifty 100",
-            "Nifty 500",
-            "Nifty Microcap 250",
-            "Nifty Total Market (~750)",
-        ],
-        index=2,
+        ["Nifty 50", "Nifty 100", "Nifty 500"],
+        index=1,
     )
-
     benchmark_ticker = st.sidebar.selectbox(
-        "Benchmark Index (for Beta/Residual Calculation):",
-        ["^NSEI", "^BSESN"],
-        format_func=lambda x: (
-            "Nifty 50 (^NSEI)" if x == "^NSEI" else "Sensex (^BSESN)"
-        ),
+        "Benchmark Index:", ["^NSEI", "^BSESN"], format_func=lambda x: "Nifty 50"
     )
 
-    st.sidebar.subheader("Quantitative Metric Thresholds")
-
+    st.sidebar.subheader("Quantitative Thresholds")
     min_score, max_score = st.sidebar.slider(
         "Volatility-Adjusted Score Range:", -3.0, 5.0, (0.5, 4.0), step=0.1
     )
-
     max_dma_extension = st.sidebar.slider(
-        "Max 200 DMA Extension (%) [Exhaustion Guardrail]:",
-        10,
-        100,
-        30,
-        step=5,
+        "Max 200 DMA Extension (%):", 10, 100, 30, step=5
     )
 
-    min_beta, max_beta = st.sidebar.slider(
-        "Beta Range (vs Benchmark):", 0.0, 3.0, (0.5, 1.8), step=0.1
-    )
-
-    max_volatility = st.sidebar.slider(
-        "Max Annual Volatility (%):", 10, 100, 45, step=5
-    )
-
-    min_residual_momentum = st.sidebar.slider(
-        "Min Residual Momentum (%):", -50, 100, 0, step=5
-    )
-
-    # Fetch and compute price data with caching
     @st.cache_data(ttl=3600)
     def compute_quant_momentum(tickers, benchmark):
         all_tickers = tickers + [benchmark]
@@ -230,10 +212,11 @@ if check_password():
             all_tickers, period="1y", interval="1d", progress=False
         )
 
-        if isinstance(raw_data.columns, pd.MultiIndex):
-            data = raw_data["Close"]
-        else:
-            data = raw_data
+        data = (
+            raw_data["Close"]
+            if isinstance(raw_data.columns, pd.MultiIndex)
+            else raw_data
+        )
 
         bench_returns = data[benchmark].pct_change(fill_method=None).dropna()
         bench_total_return = (
@@ -250,15 +233,9 @@ if check_password():
 
             daily_returns = stock_series.pct_change(fill_method=None).dropna()
 
-            try:
-                info = yf.Ticker(ticker).fast_info
-                mcap_cr = round(info.market_cap / 1e7, 2)
-            except Exception:
-                mcap_cr = np.nan
-
             current_price = stock_series.iloc[-1]
             sma_200 = stock_series.rolling(window=200).mean().iloc[-1]
-            dma_200_extension = (
+            dma_200_ext = (
                 ((current_price - sma_200) / sma_200) * 100
                 if sma_200 > 0
                 else 0
@@ -281,36 +258,15 @@ if check_password():
             bench_var = np.var(aligned["bench"])
             beta = cov / bench_var if bench_var > 0 else 1.0
 
-            stock_total_return = (
-                current_price - stock_series.iloc[0]
-            ) / stock_series.iloc[0]
-            residual_momentum = stock_total_return - (
-                beta * bench_total_return
-            )
-
-            # Paper Trade Execution simulation
-            paper_res = simulate_paper_trade(
-                stock_series,
-                capital_per_trade=100000,
-                target_pct=0.10,
-                stop_loss_pct=0.05,
-            )
-
             results.append(
                 {
                     "Ticker": ticker.replace(".NS", "").replace(".BO", ""),
-                    "Market Cap (Cr)": mcap_cr,
-                    "200 DMA Ext (%)": round(dma_200_extension, 2),
+                    "200 DMA Ext (%)": round(dma_200_ext, 2),
                     "12M-1M Return (%)": round(raw_12m_1m_return * 100, 2),
                     "Annual Volatility (%)": round(annualized_vol * 100, 2),
                     "Vol-Adjusted Score": round(vol_adjusted_score, 2),
                     "Beta": round(beta, 2),
-                    "Residual Return (%)": round(residual_momentum * 100, 2),
-                    "Paper Status": paper_res["Paper Trade Status"],
-                    "Days Held": paper_res["Days Held"],
-                    "Exit Reason": paper_res["Exit Reason"],
-                    "Paper Return (%)": paper_res["Return (%)"],
-                    "Paper PnL (INR)": paper_res["PnL (INR)"],
+                    "Price Series": stock_series,
                 }
             )
 
@@ -327,108 +283,98 @@ if check_password():
     tickers_list = fetch_universe_tickers(universe_type)
 
     with st.spinner(
-        f"Fetching & Backtesting Paper Trades for {len(tickers_list)} stocks"
-        f" in {universe_type}..."
+        f"Processing Momentum Metrics & Paper Simulations for {len(tickers_list)} stocks..."
     ):
         df_raw = compute_quant_momentum(tickers_list, benchmark_ticker)
 
     if not df_raw.empty:
-        min_mcap = (
-            int(df_raw["Market Cap (Cr)"].min(skipna=True))
-            if not df_raw["Market Cap (Cr)"].isna().all()
-            else 0
-        )
-        max_mcap = (
-            int(df_raw["Market Cap (Cr)"].max(skipna=True))
-            if not df_raw["Market Cap (Cr)"].isna().all()
-            else 100000
-        )
-
-        mcap_range = st.sidebar.slider(
-            "Market Cap Range (INR Crores):",
-            min_value=min_mcap,
-            max_value=max_mcap if max_mcap > min_mcap else min_mcap + 1000,
-            value=(
-                min_mcap,
-                max_mcap if max_mcap > min_mcap else min_mcap + 1000,
-            ),
-        )
-
         filtered_df = df_raw[
             (df_raw["Vol-Adjusted Score"] >= min_score)
             & (df_raw["Vol-Adjusted Score"] <= max_score)
             & (df_raw["200 DMA Ext (%)"] <= max_dma_extension)
-            & (df_raw["Beta"] >= min_beta)
-            & (df_raw["Beta"] <= max_beta)
-            & (df_raw["Annual Volatility (%)"] <= max_volatility)
-            & (df_raw["Residual Return (%)"] >= min_residual_momentum)
-            & (
-                df_raw["Market Cap (Cr)"].isna()
-                | (
-                    (df_raw["Market Cap (Cr)"] >= mcap_range[0])
-                    & (df_raw["Market Cap (Cr)"] <= mcap_range[1])
-                )
-            )
-        ]
+        ].copy()
 
-        # Overall Portfolio Metrics
-        total_allocated = len(filtered_df) * 100000
-        total_pnl = (
-            filtered_df["Paper PnL (INR)"].sum() if not filtered_df.empty else 0
+        # Stagger entry dates stock by stock starting from base_start_date
+        sim_results = []
+        for idx, row in filtered_df.iterrows():
+            # First stock gets base_start_date (tomorrow), subsequent stocks get added stagger_days apart
+            assigned_entry_date = base_start_date + timedelta(
+                days=idx * stagger_days
+            )
+
+            sim = simulate_paper_trade(
+                row["Price Series"],
+                entry_date=assigned_entry_date,
+                capital_per_trade=100000,
+                target_pct=0.10,
+                stop_loss_pct=0.05,
+            )
+            sim_results.append(sim)
+
+        sim_df = pd.DataFrame(sim_results)
+
+        # Merge simulation columns with filtered metrics
+        display_df = pd.concat(
+            [filtered_df.drop(columns=["Price Series"]), sim_df], axis=1
         )
+
+        # Overall Summary Calculation
+        total_allocated = len(display_df) * 100000
+        total_pnl = display_df["PnL (INR)"].sum()
         total_return_pct = (
             (total_pnl / total_allocated) * 100 if total_allocated > 0 else 0
         )
-        avg_days = (
-            filtered_df["Days Held"].mean()
-            if not filtered_df.empty
-            else 0
-        )
+        avg_days = display_df["Days Held"].mean() if not display_df.empty else 0
 
-        # Performance Header Cards
-        st.subheader("💵 Paper Trading Portfolio Summary")
+        # Summary Header
+        st.subheader("💵 Staggered Paper Portfolio Overview")
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Filtered Candidates", len(filtered_df))
+        m1.metric("Qualified Stocks", len(display_df))
         m2.metric("Total Capital Allocated", f"₹{total_allocated:,.0f}")
         m3.metric(
-            "Total Paper PnL",
+            "Total Portfolio PnL",
             f"₹{total_pnl:,.2f}",
-            delta=f"{total_return_pct:.2f}% Total Return",
+            delta=f"{total_return_pct:.2f}% Net Return",
         )
         m4.metric("Avg Days Held", f"{avg_days:.1f} Days")
         m5.metric(
-            "Win Rate (%)",
-            f"{(len(filtered_df[filtered_df['Paper Return (%)'] > 0]) / len(filtered_df) * 100):.1f}%"
-            if not filtered_df.empty
-            else "N/A",
+            "Open vs Closed",
+            f"{len(display_df[display_df['Paper Status'] == 'OPEN'])} Open / {len(display_df[display_df['Paper Status'] == 'CLOSED'])} Closed",
         )
 
         st.divider()
 
-        st.subheader("📋 Quant Momentum Screener & Paper Trading Ledger")
+        # Detailed Display
+        st.subheader("📋 Sequential Paper Execution Ledger")
         st.dataframe(
-            filtered_df.style.highlight_max(
-                axis=0, subset=["Vol-Adjusted Score", "Paper Return (%)"]
+            display_df.style.highlight_max(
+                axis=0, subset=["Vol-Adjusted Score", "Return (%)"]
             ),
             use_container_width=True,
         )
 
-        st.subheader("📊 Paper Trading Performance Distribution")
-        if not filtered_df.empty:
-            fig = px.bar(
-                filtered_df,
+        # Charting
+        st.subheader("📊 Trade PnL & Holding Duration Breakdown")
+        col_c1, col_c2 = st.columns(2)
+
+        with col_c1:
+            fig_pnl = px.bar(
+                display_df,
                 x="Ticker",
-                y="Paper Return (%)",
-                color="Exit Reason",
-                title=(
-                    "Paper Trade Returns per Stock (₹1 Lakh Allocation with"
-                    " Trailing Stop)"
-                ),
-                labels={"Paper Return (%)": "Return (%)"},
+                y="PnL (INR)",
+                color="Paper Status",
+                title="PnL per Stock (₹1 Lakh Allocation)",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig_pnl, use_container_width=True)
+
+        with col_c2:
+            fig_days = px.bar(
+                display_df,
+                x="Ticker",
+                y="Days Held",
+                color="Exit Reason",
+                title="Days Held per Position",
+            )
+            st.plotly_chart(fig_days, use_container_width=True)
     else:
-        st.error(
-            "No data fetched. Check your internet connection or ticker"
-            " universe."
-        )
+        st.error("No data fetched. Try adjusting filter ranges.")
