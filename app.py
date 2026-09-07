@@ -48,7 +48,7 @@ def check_password():
 
 
 # -----------------------------------------------------------------------------
-# PAPER TRADING SIMULATION ENGINE WITH DYNAMIC ENTRY DATES
+# PAPER TRADING SIMULATION ENGINE WITH FORWARD EXECUTION
 # -----------------------------------------------------------------------------
 def simulate_paper_trade(
     price_series,
@@ -59,9 +59,9 @@ def simulate_paper_trade(
 ):
     """Simulates paper trading starting from a specific entry_date forward.
 
-    Allocates fixed capital (₹1 Lakh) and tracks status, days held, trailing stop, and PnL.
+    Allocates fixed capital (₹1 Lakh) and tracks status, days held, trailing
+    stop, and PnL.
     """
-    # Ensure datetime index format
     price_series.index = pd.to_datetime(price_series.index)
     entry_dt = pd.to_datetime(entry_date)
 
@@ -99,7 +99,7 @@ def simulate_paper_trade(
     days_held = len(forward_prices)
 
     for idx, (dt, price) in enumerate(forward_prices.items()):
-        # Trail stop-loss if new high achieved
+        # Trail stop-loss if new peak is formed
         if price > peak_price:
             peak_price = price
             current_stop = max(current_stop, peak_price * (1 - stop_loss_pct))
@@ -144,22 +144,9 @@ def simulate_paper_trade(
 if check_password():
 
     st.title("📈 Institutional Momentum Screener & Paper Trader")
-    st.caption("Trailing Stop-Loss Execution & Staggered Paper Trading Ledger")
+    st.caption("Volatility-Adjusted Momentum Engine with Live Paper Execution")
 
-    st.sidebar.header("🔍 Screener & Staggering Settings")
-
-    # Entry Date Setup: Tomorrow's Date for 1st stock
-    tomorrow_date = datetime.now().date() + timedelta(days=1)
-    base_start_date = st.sidebar.date_input(
-        "First Candidate Entry Date:", tomorrow_date
-    )
-    stagger_days = st.sidebar.number_input(
-        "Days Stagger Between Subsequent Stocks:",
-        min_value=0,
-        max_value=10,
-        value=1,
-        help="Number of trading days between adding sequential stocks to the portfolio.",
-    )
+    st.sidebar.header("🔍 Universe & Schedule Settings")
 
     @st.cache_data(ttl=86400)
     def fetch_universe_tickers(universe_name):
@@ -173,8 +160,23 @@ if check_password():
             "Nifty 500": (
                 "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
             ),
+            "Nifty Microcap 250": (
+                "https://archives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv"
+            ),
+            "Nifty Total Market (~750)": (
+                "https://archives.nseindia.com/content/indices/ind_niftytotalmarket_list.csv"
+            ),
         }
         url = urls.get(universe_name)
+        if not url:
+            return [
+                "RELIANCE.NS",
+                "TCS.NS",
+                "INFY.NS",
+                "HDFCBANK.NS",
+                "ICICIBANK.NS",
+            ]
+
         try:
             df = pd.read_csv(url)
             symbols = df["Symbol"].dropna().str.strip().tolist()
@@ -188,23 +190,68 @@ if check_password():
                 "ICICIBANK.NS",
             ]
 
+    # Universe Selection Dropdown
     universe_type = st.sidebar.selectbox(
         "Select Stock Universe:",
-        ["Nifty 50", "Nifty 100", "Nifty 500"],
-        index=1,
-    )
-    benchmark_ticker = st.sidebar.selectbox(
-        "Benchmark Index:", ["^NSEI", "^BSESN"], format_func=lambda x: "Nifty 50"
+        [
+            "Nifty 50",
+            "Nifty 100",
+            "Nifty 500",
+            "Nifty Microcap 250",
+            "Nifty Total Market (~750)",
+        ],
+        index=4,  # Default to Nifty Total Market (~750)
     )
 
-    st.sidebar.subheader("Quantitative Thresholds")
+    benchmark_ticker = st.sidebar.selectbox(
+        "Benchmark Index (for Beta/Residual Calculation):",
+        ["^NSEI", "^BSESN"],
+        format_func=lambda x: (
+            "Nifty 50 (^NSEI)" if x == "^NSEI" else "Sensex (^BSESN)"
+        ),
+    )
+
+    # Entry Date Stagger Settings
+    tomorrow_date = datetime.now().date() + timedelta(days=1)
+    base_start_date = st.sidebar.date_input(
+        "First Candidate Entry Date:", tomorrow_date
+    )
+    stagger_days = st.sidebar.number_input(
+        "Stagger Days Between Subsequent Additions:",
+        min_value=0,
+        max_value=10,
+        value=1,
+        help="Trading days delay before adding the next candidate stock to paper portfolio.",
+    )
+
+    st.sidebar.divider()
+    st.sidebar.subheader("⚙️ Quantitative Metric Filters")
+
     min_score, max_score = st.sidebar.slider(
         "Volatility-Adjusted Score Range:", -3.0, 5.0, (0.5, 4.0), step=0.1
     )
+
     max_dma_extension = st.sidebar.slider(
-        "Max 200 DMA Extension (%):", 10, 100, 30, step=5
+        "Max 200 DMA Extension (%) [Exhaustion Guardrail]:",
+        10,
+        100,
+        30,
+        step=5,
     )
 
+    min_beta, max_beta = st.sidebar.slider(
+        "Beta Range (vs Benchmark):", 0.0, 3.0, (0.5, 1.8), step=0.1
+    )
+
+    max_volatility = st.sidebar.slider(
+        "Max Annual Volatility (%):", 10, 100, 45, step=5
+    )
+
+    min_residual_momentum = st.sidebar.slider(
+        "Min Residual Return (%):", -50, 100, 0, step=5
+    )
+
+    # Computation Engine
     @st.cache_data(ttl=3600)
     def compute_quant_momentum(tickers, benchmark):
         all_tickers = tickers + [benchmark]
@@ -233,6 +280,12 @@ if check_password():
 
             daily_returns = stock_series.pct_change(fill_method=None).dropna()
 
+            try:
+                info = yf.Ticker(ticker).fast_info
+                mcap_cr = round(info.market_cap / 1e7, 2)
+            except Exception:
+                mcap_cr = np.nan
+
             current_price = stock_series.iloc[-1]
             sma_200 = stock_series.rolling(window=200).mean().iloc[-1]
             dma_200_ext = (
@@ -258,14 +311,23 @@ if check_password():
             bench_var = np.var(aligned["bench"])
             beta = cov / bench_var if bench_var > 0 else 1.0
 
+            stock_total_return = (
+                current_price - stock_series.iloc[0]
+            ) / stock_series.iloc[0]
+            residual_momentum = stock_total_return - (
+                beta * bench_total_return
+            )
+
             results.append(
                 {
                     "Ticker": ticker.replace(".NS", "").replace(".BO", ""),
+                    "Market Cap (Cr)": mcap_cr,
                     "200 DMA Ext (%)": round(dma_200_ext, 2),
                     "12M-1M Return (%)": round(raw_12m_1m_return * 100, 2),
                     "Annual Volatility (%)": round(annualized_vol * 100, 2),
                     "Vol-Adjusted Score": round(vol_adjusted_score, 2),
                     "Beta": round(beta, 2),
+                    "Residual Return (%)": round(residual_momentum * 100, 2),
                     "Price Series": stock_series,
                 }
             )
@@ -283,25 +345,56 @@ if check_password():
     tickers_list = fetch_universe_tickers(universe_type)
 
     with st.spinner(
-        f"Processing Momentum Metrics & Paper Simulations for {len(tickers_list)} stocks..."
+        f"Processing Momentum Metrics & Paper Simulation for {len(tickers_list)} tickers in {universe_type}..."
     ):
         df_raw = compute_quant_momentum(tickers_list, benchmark_ticker)
 
     if not df_raw.empty:
+        min_mcap = (
+            int(df_raw["Market Cap (Cr)"].min(skipna=True))
+            if not df_raw["Market Cap (Cr)"].isna().all()
+            else 0
+        )
+        max_mcap = (
+            int(df_raw["Market Cap (Cr)"].max(skipna=True))
+            if not df_raw["Market Cap (Cr)"].isna().all()
+            else 100000
+        )
+
+        mcap_range = st.sidebar.slider(
+            "Market Cap Range (INR Crores):",
+            min_value=min_mcap,
+            max_value=max_mcap if max_mcap > min_mcap else min_mcap + 1000,
+            value=(
+                min_mcap,
+                max_mcap if max_mcap > min_mcap else min_mcap + 1000,
+            ),
+        )
+
+        # Apply Screener Filters
         filtered_df = df_raw[
             (df_raw["Vol-Adjusted Score"] >= min_score)
             & (df_raw["Vol-Adjusted Score"] <= max_score)
             & (df_raw["200 DMA Ext (%)"] <= max_dma_extension)
+            & (df_raw["Beta"] >= min_beta)
+            & (df_raw["Beta"] <= max_beta)
+            & (df_raw["Annual Volatility (%)"] <= max_volatility)
+            & (df_raw["Residual Return (%)"] >= min_residual_momentum)
+            & (
+                df_raw["Market Cap (Cr)"].isna()
+                | (
+                    (df_raw["Market Cap (Cr)"] >= mcap_range[0])
+                    & (df_raw["Market Cap (Cr)"] <= mcap_range[1])
+                )
+            )
         ].copy()
 
-        # Stagger entry dates stock by stock starting from base_start_date
+        # Run Paper Trade Simulation for Filtered Candidates
         sim_results = []
-        for idx, row in filtered_df.iterrows():
-            # First stock gets base_start_date (tomorrow), subsequent stocks get added stagger_days apart
+        for idx, row in filtered_df.reset_index(drop=True).iterrows():
             assigned_entry_date = base_start_date + timedelta(
                 days=idx * stagger_days
             )
-
             sim = simulate_paper_trade(
                 row["Price Series"],
                 entry_date=assigned_entry_date,
@@ -313,23 +406,30 @@ if check_password():
 
         sim_df = pd.DataFrame(sim_results)
 
-        # Merge simulation columns with filtered metrics
         display_df = pd.concat(
-            [filtered_df.drop(columns=["Price Series"]), sim_df], axis=1
+            [
+                filtered_df.drop(columns=["Price Series"]).reset_index(
+                    drop=True
+                ),
+                sim_df,
+            ],
+            axis=1,
         )
 
-        # Overall Summary Calculation
+        # Summary Metrics
         total_allocated = len(display_df) * 100000
-        total_pnl = display_df["PnL (INR)"].sum()
+        total_pnl = (
+            display_df["PnL (INR)"].sum() if not display_df.empty else 0
+        )
         total_return_pct = (
             (total_pnl / total_allocated) * 100 if total_allocated > 0 else 0
         )
         avg_days = display_df["Days Held"].mean() if not display_df.empty else 0
 
-        # Summary Header
-        st.subheader("💵 Staggered Paper Portfolio Overview")
+        # Performance Metrics Header
+        st.subheader("💵 Portfolio Overview & Paper Execution")
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Qualified Stocks", len(display_df))
+        m1.metric("Qualified Candidates", len(display_df))
         m2.metric("Total Capital Allocated", f"₹{total_allocated:,.0f}")
         m3.metric(
             "Total Portfolio PnL",
@@ -338,14 +438,16 @@ if check_password():
         )
         m4.metric("Avg Days Held", f"{avg_days:.1f} Days")
         m5.metric(
-            "Open vs Closed",
-            f"{len(display_df[display_df['Paper Status'] == 'OPEN'])} Open / {len(display_df[display_df['Paper Status'] == 'CLOSED'])} Closed",
+            "Status Breakdown",
+            f"{len(display_df[display_df['Paper Status'] == 'OPEN'])} Open / "
+            f"{len(display_df[display_df['Paper Status'] == 'CLOSED'])} Closed / "
+            f"{len(display_df[display_df['Paper Status'].str.contains('PENDING', na=False)])} Scheduled",
         )
 
         st.divider()
 
-        # Detailed Display
-        st.subheader("📋 Sequential Paper Execution Ledger")
+        # Quantitative Ledger Table
+        st.subheader("📋 Momentum Screener & Staggered Execution Ledger")
         st.dataframe(
             display_df.style.highlight_max(
                 axis=0, subset=["Vol-Adjusted Score", "Return (%)"]
@@ -353,28 +455,30 @@ if check_password():
             use_container_width=True,
         )
 
-        # Charting
-        st.subheader("📊 Trade PnL & Holding Duration Breakdown")
-        col_c1, col_c2 = st.columns(2)
-
-        with col_c1:
+        # Visualization
+        st.subheader("📊 Individual Trade Breakdown")
+        col1, col2 = st.columns(2)
+        with col1:
             fig_pnl = px.bar(
                 display_df,
                 x="Ticker",
                 y="PnL (INR)",
                 color="Paper Status",
-                title="PnL per Stock (₹1 Lakh Allocation)",
+                title="PnL per Stock (₹1 Lakh Fixed Allocation)",
             )
             st.plotly_chart(fig_pnl, use_container_width=True)
 
-        with col_c2:
+        with col2:
             fig_days = px.bar(
                 display_df,
                 x="Ticker",
                 y="Days Held",
                 color="Exit Reason",
-                title="Days Held per Position",
+                title="Holding Duration per Ticker (Days)",
             )
             st.plotly_chart(fig_days, use_container_width=True)
     else:
-        st.error("No data fetched. Try adjusting filter ranges.")
+        st.error(
+            "No stocks met the current criteria. Try loosening your filter"
+            " threshold ranges in the sidebar."
+        )
