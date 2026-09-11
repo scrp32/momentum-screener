@@ -68,7 +68,7 @@ def simulate_paper_trade(
     # Filter price series from entry date onwards
     forward_prices = price_series[price_series.index >= entry_dt]
 
-    # If entry date is in the future (e.g. Tomorrow), mark as PENDING
+    # If entry date is in the future, mark as PENDING
     if forward_prices.empty or entry_dt > pd.to_datetime(datetime.now().date()):
         latest_price = price_series.iloc[-1]
         return {
@@ -144,7 +144,10 @@ def simulate_paper_trade(
 if check_password():
 
     st.title("📈 Institutional Momentum Screener & Paper Trader")
-    st.caption("Volatility-Adjusted Momentum Engine with Live Paper Execution")
+    st.caption(
+        "Volatility-Adjusted Momentum & Daily Volume Imbalance Execution"
+        " Engine"
+    )
 
     st.sidebar.header("🔍 Universe & Schedule Settings")
 
@@ -190,7 +193,6 @@ if check_password():
                 "ICICIBANK.NS",
             ]
 
-    # Universe Selection Dropdown
     universe_type = st.sidebar.selectbox(
         "Select Stock Universe:",
         [
@@ -225,7 +227,31 @@ if check_password():
     )
 
     st.sidebar.divider()
-    st.sidebar.subheader("⚙️ Quantitative Metric Filters")
+    st.sidebar.subheader("📊 Volume Imbalance & Trend Filters")
+
+    min_vol_imbalance = st.sidebar.slider(
+        "Min 20D Volume Imbalance Ratio (%):",
+        -50.0,
+        50.0,
+        0.0,
+        step=5.0,
+        help="Filters for stocks where volume is weighted heavily toward intra-day buying pressure.",
+    )
+
+    require_above_20dma = st.sidebar.checkbox(
+        "Require Price > 20 DMA (Avoid Active Pullbacks)",
+        value=True,
+        help="Ensures stock is in short-term uptrend and not currently undergoing a pullback.",
+    )
+
+    exclude_distribution = st.sidebar.checkbox(
+        "Exclude Distribution Stocks (Imbalance < 0)",
+        value=True,
+        help="Strips out stocks showing net institutional selling pressure.",
+    )
+
+    st.sidebar.divider()
+    st.sidebar.subheader("⚙️ Momentum & Volatility Filters")
 
     min_score, max_score = st.sidebar.slider(
         "Volatility-Adjusted Score Range:", -3.0, 5.0, (0.5, 4.0), step=0.1
@@ -235,7 +261,7 @@ if check_password():
         "Max 200 DMA Extension (%) [Exhaustion Guardrail]:",
         10,
         100,
-        30,
+        25,
         step=5,
     )
 
@@ -244,14 +270,16 @@ if check_password():
     )
 
     max_volatility = st.sidebar.slider(
-        "Max Annual Volatility (%):", 10, 100, 45, step=5
+        "Max Annual Volatility (%):", 10, 100, 40, step=5
     )
 
     min_residual_momentum = st.sidebar.slider(
         "Min Residual Return (%):", -50, 100, 0, step=5
     )
 
-    # Computation Engine
+    # -------------------------------------------------------------------------
+    # QUANTITATIVE COMPUTATION ENGINE WITH VOLUME IMBALANCE PROXY
+    # -------------------------------------------------------------------------
     @st.cache_data(ttl=3600)
     def compute_quant_momentum(tickers, benchmark):
         all_tickers = tickers + [benchmark]
@@ -259,26 +287,47 @@ if check_password():
             all_tickers, period="1y", interval="1d", progress=False
         )
 
-        data = (
+        close_data = (
             raw_data["Close"]
             if isinstance(raw_data.columns, pd.MultiIndex)
             else raw_data
         )
+        high_data = (
+            raw_data["High"]
+            if isinstance(raw_data.columns, pd.MultiIndex)
+            else raw_data
+        )
+        low_data = (
+            raw_data["Low"]
+            if isinstance(raw_data.columns, pd.MultiIndex)
+            else raw_data
+        )
+        vol_data = (
+            raw_data["Volume"]
+            if isinstance(raw_data.columns, pd.MultiIndex)
+            else raw_data
+        )
 
-        bench_returns = data[benchmark].pct_change(fill_method=None).dropna()
+        bench_returns = (
+            close_data[benchmark].pct_change(fill_method=None).dropna()
+        )
         bench_total_return = (
-            data[benchmark].iloc[-1] - data[benchmark].iloc[0]
-        ) / data[benchmark].iloc[0]
+            close_data[benchmark].iloc[-1] - close_data[benchmark].iloc[0]
+        ) / close_data[benchmark].iloc[0]
 
         results = []
-        tickers_to_process = [t for t in tickers if t in data.columns]
+        tickers_to_process = [t for t in tickers if t in close_data.columns]
 
         for ticker in tickers_to_process:
-            stock_series = data[ticker].dropna()
-            if len(stock_series) < 200:
+            stock_close = close_data[ticker].dropna()
+            if len(stock_close) < 200:
                 continue
 
-            daily_returns = stock_series.pct_change(fill_method=None).dropna()
+            stock_high = high_data[ticker].dropna()
+            stock_low = low_data[ticker].dropna()
+            stock_vol = vol_data[ticker].dropna()
+
+            daily_returns = stock_close.pct_change(fill_method=None).dropna()
 
             try:
                 info = yf.Ticker(ticker).fast_info
@@ -286,16 +335,50 @@ if check_password():
             except Exception:
                 mcap_cr = np.nan
 
-            current_price = stock_series.iloc[-1]
-            sma_200 = stock_series.rolling(window=200).mean().iloc[-1]
+            current_price = stock_close.iloc[-1]
+            sma_20 = stock_close.rolling(window=20).mean().iloc[-1]
+            sma_200 = stock_close.rolling(window=200).mean().iloc[-1]
+            is_above_20dma = current_price > sma_20
+
             dma_200_ext = (
                 ((current_price - sma_200) / sma_200) * 100
                 if sma_200 > 0
                 else 0
             )
 
-            price_12m_ago = stock_series.iloc[0]
-            price_1m_ago = stock_series.iloc[-21]
+            # Volume Imbalance Proxy Calculation (Last 20 Days)
+            # CLV = [(Close - Low) - (High - Close)] / (High - Low)
+            denom = stock_high - stock_low
+            denom = denom.replace(
+                0, np.nan
+            )  # Avoid zero division on tight days
+            clv = (
+                (stock_close - stock_low) - (stock_high - stock_close)
+            ) / denom
+            clv = clv.fillna(0)
+
+            # Volume-Weighted Imbalance over last 20 sessions
+            recent_clv = clv.iloc[-20:]
+            recent_vol = stock_vol.iloc[-20:]
+
+            sum_vol = recent_vol.sum()
+            if sum_vol > 0:
+                vol_imbalance_ratio = (
+                    (recent_clv * recent_vol).sum() / sum_vol
+                ) * 100
+            else:
+                vol_imbalance_ratio = 0.0
+
+            # Flow Tagging
+            if vol_imbalance_ratio >= 15.0:
+                flow_status = "🟢 Strong Accumulation"
+            elif vol_imbalance_ratio <= -15.0:
+                flow_status = "🔴 Heavy Distribution"
+            else:
+                flow_status = "🟡 Neutral Flow"
+
+            price_12m_ago = stock_close.iloc[0]
+            price_1m_ago = stock_close.iloc[-21]
             raw_12m_1m_return = (price_1m_ago - price_12m_ago) / price_12m_ago
 
             annualized_vol = daily_returns.std() * np.sqrt(252)
@@ -312,8 +395,8 @@ if check_password():
             beta = cov / bench_var if bench_var > 0 else 1.0
 
             stock_total_return = (
-                current_price - stock_series.iloc[0]
-            ) / stock_series.iloc[0]
+                current_price - stock_close.iloc[0]
+            ) / stock_close.iloc[0]
             residual_momentum = stock_total_return - (
                 beta * bench_total_return
             )
@@ -323,12 +406,15 @@ if check_password():
                     "Ticker": ticker.replace(".NS", "").replace(".BO", ""),
                     "Market Cap (Cr)": mcap_cr,
                     "200 DMA Ext (%)": round(dma_200_ext, 2),
+                    "20D Vol Imbalance (%)": round(vol_imbalance_ratio, 2),
+                    "Institutional Flow": flow_status,
+                    "Above 20 DMA": is_above_20dma,
                     "12M-1M Return (%)": round(raw_12m_1m_return * 100, 2),
                     "Annual Volatility (%)": round(annualized_vol * 100, 2),
                     "Vol-Adjusted Score": round(vol_adjusted_score, 2),
                     "Beta": round(beta, 2),
                     "Residual Return (%)": round(residual_momentum * 100, 2),
-                    "Price Series": stock_series,
+                    "Price Series": stock_close,
                 }
             )
 
@@ -345,7 +431,7 @@ if check_password():
     tickers_list = fetch_universe_tickers(universe_type)
 
     with st.spinner(
-        f"Processing Momentum Metrics & Paper Simulation for {len(tickers_list)} tickers in {universe_type}..."
+        f"Processing Momentum & Volume Imbalance Metrics for {len(tickers_list)} tickers..."
     ):
         df_raw = compute_quant_momentum(tickers_list, benchmark_ticker)
 
@@ -376,6 +462,7 @@ if check_password():
             (df_raw["Vol-Adjusted Score"] >= min_score)
             & (df_raw["Vol-Adjusted Score"] <= max_score)
             & (df_raw["200 DMA Ext (%)"] <= max_dma_extension)
+            & (df_raw["20D Vol Imbalance (%)"] >= min_vol_imbalance)
             & (df_raw["Beta"] >= min_beta)
             & (df_raw["Beta"] <= max_beta)
             & (df_raw["Annual Volatility (%)"] <= max_volatility)
@@ -389,7 +476,16 @@ if check_password():
             )
         ].copy()
 
-        # Run Paper Trade Simulation for Filtered Candidates
+        # Dynamic Filters
+        if require_above_20dma:
+            filtered_df = filtered_df[filtered_df["Above 20 DMA"] == True]
+
+        if exclude_distribution:
+            filtered_df = filtered_df[
+                filtered_df["20D Vol Imbalance (%)"] >= 0.0
+            ]
+
+        # Run Paper Trade Simulation for Candidates
         sim_results = []
         for idx, row in filtered_df.reset_index(drop=True).iterrows():
             assigned_entry_date = base_start_date + timedelta(
@@ -446,17 +542,22 @@ if check_password():
 
         st.divider()
 
-        # Quantitative Ledger Table
-        st.subheader("📋 Momentum Screener & Staggered Execution Ledger")
+        # Detailed Table
+        st.subheader("📋 Momentum & Volume Imbalance Ledger")
         st.dataframe(
             display_df.style.highlight_max(
-                axis=0, subset=["Vol-Adjusted Score", "Return (%)"]
+                axis=0,
+                subset=[
+                    "Vol-Adjusted Score",
+                    "20D Vol Imbalance (%)",
+                    "Return (%)",
+                ],
             ),
             use_container_width=True,
         )
 
-        # Visualization
-        st.subheader("📊 Individual Trade Breakdown")
+        # Charts
+        st.subheader("📊 Volume Imbalance & PnL Analytics")
         col1, col2 = st.columns(2)
         with col1:
             fig_pnl = px.bar(
@@ -469,14 +570,16 @@ if check_password():
             st.plotly_chart(fig_pnl, use_container_width=True)
 
         with col2:
-            fig_days = px.bar(
+            fig_vol = px.scatter(
                 display_df,
-                x="Ticker",
-                y="Days Held",
-                color="Exit Reason",
-                title="Holding Duration per Ticker (Days)",
+                x="20D Vol Imbalance (%)",
+                y="Vol-Adjusted Score",
+                color="Institutional Flow",
+                size="Market Cap (Cr)",
+                hover_name="Ticker",
+                title="Volume Imbalance vs Momentum Score",
             )
-            st.plotly_chart(fig_days, use_container_width=True)
+            st.plotly_chart(fig_vol, use_container_width=True)
     else:
         st.error(
             "No stocks met the current criteria. Try loosening your filter"
